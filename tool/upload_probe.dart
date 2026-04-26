@@ -22,6 +22,7 @@ Future<void> main(List<String> args) async {
   stdout.writeln('upload: ${config.uploadUri}');
   stdout.writeln('userAgent: $_userAgent');
   stdout.writeln('fixedIp: ${options.overrideIp ?? '-'}');
+  stdout.writeln('verbose: ${options.verbose}');
   stdout.writeln(
     'responseTimeoutMs: ${options.responseTimeout.inMilliseconds}',
   );
@@ -73,6 +74,7 @@ Future<void> _runProbe({
         duration: duration,
         responseTimeout: responseTimeout,
         chunkSize: chunkSize,
+        verbose: options.verbose,
       ),
     );
   }
@@ -89,6 +91,14 @@ Future<void> _runProbe({
     final uploadElapsed = _uploadElapsed(stopwatch.elapsed, duration);
     final mbps = _bytesToMbps(writtenBytes, uploadElapsed);
     final faultCount = results.where((result) => result.faulted).length;
+    final serverBytes = results.fold<int>(
+      0,
+      (sum, result) => sum + (result.serverSample?.bytes ?? 0),
+    );
+    final serverBps = results.fold<int>(
+      0,
+      (sum, result) => sum + (result.serverSample?.bps ?? 0),
+    );
     final details = results
         .map((result) => result.detail)
         .where((detail) => detail.isNotEmpty)
@@ -104,6 +114,8 @@ Future<void> _runProbe({
       '$modeLabel: bytes=$writtenBytes elapsed=${stopwatch.elapsedMilliseconds}ms '
       'uploadWindowMs=${uploadElapsed.inMilliseconds} '
       'mbps=${mbps.toStringAsFixed(2)} faults=$faultCount '
+      'serverBytes=${serverBytes == 0 ? '-' : serverBytes} '
+      'serverMbps=${serverBps == 0 ? '-' : _bpsToMbps(serverBps).toStringAsFixed(2)} '
       'usedIps=[${usedIps.isEmpty ? '-' : usedIps}] details=[$details]',
     );
   } catch (error, stackTrace) {
@@ -121,6 +133,7 @@ Future<_UploadProbeResult> _sendUploadRequest({
   required Duration duration,
   required Duration responseTimeout,
   required int chunkSize,
+  required bool verbose,
 }) async {
   final client = HttpClient()
     ..connectionTimeout = const Duration(seconds: 12)
@@ -174,24 +187,53 @@ Future<_UploadProbeResult> _sendUploadRequest({
       final response = await request.close().timeout(responseTimeout);
       final usedIp =
           response.connectionInfo?.remoteAddress.address ?? requestUsedIp;
+      final statusCode = response.statusCode;
+      final responseHeaders = _formatHeaders(response.headers);
       if (response.statusCode >= 400) {
+        final responseBody = await _readResponseBody(
+          response: response,
+          timeout: responseTimeout,
+        );
+        final serverSample = _parseServerSample(responseBody);
+        if (verbose) {
+          _printResponseDebug(
+            prefix: 'upload',
+            statusCode: statusCode,
+            headers: responseHeaders,
+            body: responseBody,
+          );
+        }
         return _UploadProbeResult(
           bytes: uploadedBytes,
           faulted: true,
           usedIp: usedIp,
-          detail: 'http ${response.statusCode}',
+          detail: _formatDetail(statusCode, responseBody, serverSample),
+          serverSample: serverSample,
         );
       }
       final drainTimeout = responseTimeout - responseStopwatch.elapsed;
       if (drainTimeout <= Duration.zero) {
         throw TimeoutException('response timeout');
       }
-      await response.drain<void>().timeout(drainTimeout);
+      final responseBody = await _readResponseBody(
+        response: response,
+        timeout: drainTimeout,
+      );
+      final serverSample = _parseServerSample(responseBody);
+      if (verbose) {
+        _printResponseDebug(
+          prefix: 'upload',
+          statusCode: statusCode,
+          headers: responseHeaders,
+          body: responseBody,
+        );
+      }
       return _UploadProbeResult(
         bytes: uploadedBytes,
         faulted: false,
         usedIp: usedIp,
-        detail: 'http ${response.statusCode}',
+        detail: _formatDetail(statusCode, responseBody, serverSample),
+        serverSample: serverSample,
       );
     } on TimeoutException {
       final usedIp = request.connectionInfo?.remoteAddress.address;
@@ -201,6 +243,7 @@ Future<_UploadProbeResult> _sendUploadRequest({
         faulted: false,
         usedIp: usedIp,
         detail: 'response timeout',
+        serverSample: null,
       );
     } catch (error) {
       final usedIp = request.connectionInfo?.remoteAddress.address;
@@ -210,11 +253,58 @@ Future<_UploadProbeResult> _sendUploadRequest({
         faulted: true,
         usedIp: usedIp,
         detail: error.toString(),
+        serverSample: null,
       );
     }
   } finally {
     client.close(force: true);
   }
+}
+
+Future<String> _readResponseBody({
+  required HttpClientResponse response,
+  required Duration timeout,
+}) async {
+  final chunks = <int>[];
+  await for (final chunk in response.timeout(timeout)) {
+    if (chunks.length < 4096) {
+      final remaining = 4096 - chunks.length;
+      chunks.addAll(chunk.length <= remaining ? chunk : chunk.take(remaining));
+    }
+  }
+  return utf8.decode(chunks, allowMalformed: true);
+}
+
+Map<String, List<String>> _formatHeaders(HttpHeaders headers) {
+  final formatted = <String, List<String>>{};
+  headers.forEach((name, values) {
+    formatted[name] = values;
+  });
+  return formatted;
+}
+
+void _printResponseDebug({
+  required String prefix,
+  required int statusCode,
+  required Map<String, List<String>> headers,
+  required String body,
+}) {
+  stdout.writeln('$prefix response status: $statusCode');
+  stdout.writeln('$prefix response headers: ${jsonEncode(headers)}');
+  stdout.writeln('$prefix response body: ${_compact(body)}');
+}
+
+String _compact(String value) {
+  final compacted = value
+      .replaceAll(RegExp(r'[\r\n\t]+'), ' ')
+      .replaceAll(RegExp(r'\s{2,}'), ' ')
+      .trim();
+  if (compacted.isEmpty) {
+    return '-';
+  }
+  return compacted.length <= 600
+      ? compacted
+      : '${compacted.substring(0, 600)}...';
 }
 
 Stream<List<int>> _countingUploadStream({
@@ -236,6 +326,42 @@ double _bytesToMbps(int bytes, Duration elapsed) {
     return 0;
   }
   return bytes * 8 / elapsed.inMicroseconds;
+}
+
+double _bpsToMbps(int bps) {
+  if (bps <= 0) {
+    return 0;
+  }
+  return bps * 8 / 1000000;
+}
+
+_ServerUploadSample? _parseServerSample(String body) {
+  try {
+    final data = jsonDecode(body) as Map<String, dynamic>;
+    final durationMs = (data['DurationMs'] as num?)?.toInt();
+    final bytes = (data['Bytes'] as num?)?.toInt();
+    final bps = (data['BPS'] as num?)?.toInt();
+    if (durationMs == null || bytes == null || bps == null) {
+      return null;
+    }
+    return _ServerUploadSample(durationMs: durationMs, bytes: bytes, bps: bps);
+  } catch (_) {
+    return null;
+  }
+}
+
+String _formatDetail(
+  int statusCode,
+  String responseBody,
+  _ServerUploadSample? serverSample,
+) {
+  if (serverSample == null) {
+    return 'http $statusCode body=${_compact(responseBody)}';
+  }
+
+  return 'http $statusCode serverBytes=${serverSample.bytes} '
+      'serverDurationMs=${serverSample.durationMs} '
+      'serverMbps=${_bpsToMbps(serverSample.bps).toStringAsFixed(2)}';
 }
 
 Duration _uploadElapsed(Duration elapsed, Duration uploadWindow) {
@@ -284,6 +410,7 @@ Options:
   --response-timeout <seconds>
                           Time to wait for the HTTP response after upload.
                           Default: 2
+  --verbose               Print upload response headers and body.
   --help                  Show this help.
 
 macOS examples:
@@ -300,6 +427,7 @@ class _ProbeOptions {
     required this.responseTimeout,
     required this.endpointHost,
     required this.overrideIp,
+    required this.verbose,
     required this.showHelp,
   });
 
@@ -309,6 +437,7 @@ class _ProbeOptions {
     var responseTimeout = const Duration(seconds: 2);
     var endpointHost = _defaultEndpointHost;
     String? overrideIp;
+    var verbose = false;
     var showHelp = false;
 
     String readValue(int index, String option) {
@@ -325,6 +454,8 @@ class _ProbeOptions {
         case '--help':
         case '-h':
           showHelp = true;
+        case '--verbose':
+          verbose = true;
         case '--ip':
           overrideIp = readValue(index, arg).trim();
           index++;
@@ -367,6 +498,7 @@ class _ProbeOptions {
       responseTimeout: responseTimeout,
       endpointHost: endpointHost,
       overrideIp: overrideIp,
+      verbose: verbose,
       showHelp: showHelp,
     );
   }
@@ -376,6 +508,7 @@ class _ProbeOptions {
   final Duration responseTimeout;
   final String endpointHost;
   final String? overrideIp;
+  final bool verbose;
   final bool showHelp;
 }
 
@@ -401,10 +534,24 @@ class _UploadProbeResult {
     required this.faulted,
     required this.usedIp,
     required this.detail,
+    required this.serverSample,
   });
 
   final int bytes;
   final bool faulted;
   final String? usedIp;
   final String detail;
+  final _ServerUploadSample? serverSample;
+}
+
+class _ServerUploadSample {
+  const _ServerUploadSample({
+    required this.durationMs,
+    required this.bytes,
+    required this.bps,
+  });
+
+  final int durationMs;
+  final int bytes;
+  final int bps;
 }

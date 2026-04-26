@@ -158,12 +158,14 @@ class SpeedTestOptions {
     required this.endpointHost,
     required this.selectedIp,
     required this.dohProvider,
+    this.bypassVpn = false,
   });
 
   final SpeedTestMode mode;
   final String endpointHost;
   final String? selectedIp;
   final DohProvider dohProvider;
+  final bool bypassVpn;
 }
 
 class ResolvedAddressOption {

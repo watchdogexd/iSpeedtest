@@ -1,20 +1,23 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
+import 'src/app_preferences.dart';
 import 'src/speed_test_models.dart';
 import 'src/speed_test_service.dart';
-import 'src/theme_preferences.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  final themePreferences = ThemePreferences();
-  final initialThemeColorId = await themePreferences.loadThemeColorId();
+  final appPreferences = AppPreferences();
+  final initialThemeColorId = await appPreferences.loadThemeColorId();
+  final initialBypassVpn = await appPreferences.loadBypassVpn();
   runApp(
     AppleSpeedApp(
       initialThemeColorId: _resolveThemeColorId(initialThemeColorId),
-      themePreferences: themePreferences,
+      initialBypassVpn: initialBypassVpn,
+      appPreferences: appPreferences,
     ),
   );
 }
@@ -46,13 +49,15 @@ class AppleSpeedApp extends StatefulWidget {
     this.service,
     this.autoLoadEndpoints = true,
     this.initialThemeColorId,
-    this.themePreferences = const ThemePreferences(),
+    this.initialBypassVpn = false,
+    this.appPreferences = const AppPreferences(),
   });
 
   final SpeedTestService? service;
   final bool autoLoadEndpoints;
   final String? initialThemeColorId;
-  final ThemePreferences themePreferences;
+  final bool initialBypassVpn;
+  final AppPreferences appPreferences;
 
   @override
   State<AppleSpeedApp> createState() => _AppleSpeedAppState();
@@ -60,11 +65,13 @@ class AppleSpeedApp extends StatefulWidget {
 
 class _AppleSpeedAppState extends State<AppleSpeedApp> {
   late String _selectedThemeColorId;
+  late bool _bypassVpn;
 
   @override
   void initState() {
     super.initState();
     _selectedThemeColorId = _resolveThemeColorId(widget.initialThemeColorId);
+    _bypassVpn = widget.initialBypassVpn;
   }
 
   AppThemeColor get _selectedThemeColor {
@@ -123,12 +130,19 @@ class _AppleSpeedAppState extends State<AppleSpeedApp> {
         autoLoadEndpoints: widget.autoLoadEndpoints,
         themeColors: appThemeColors,
         selectedThemeColorId: _selectedThemeColorId,
+        bypassVpn: _bypassVpn,
         onThemeColorChanged: (id) {
           final themeColorId = _resolveThemeColorId(id);
           setState(() {
             _selectedThemeColorId = themeColorId;
           });
-          unawaited(widget.themePreferences.saveThemeColorId(themeColorId));
+          unawaited(widget.appPreferences.saveThemeColorId(themeColorId));
+        },
+        onBypassVpnChanged: (value) {
+          setState(() {
+            _bypassVpn = value;
+          });
+          unawaited(widget.appPreferences.saveBypassVpn(value));
         },
       ),
     );
@@ -152,14 +166,18 @@ class SpeedTestPage extends StatefulWidget {
     required this.service,
     required this.themeColors,
     required this.selectedThemeColorId,
+    required this.bypassVpn,
     required this.onThemeColorChanged,
+    required this.onBypassVpnChanged,
     this.autoLoadEndpoints = true,
   });
 
   final SpeedTestService service;
   final List<AppThemeColor> themeColors;
   final String selectedThemeColorId;
+  final bool bypassVpn;
   final ValueChanged<String> onThemeColorChanged;
+  final ValueChanged<bool> onBypassVpnChanged;
   final bool autoLoadEndpoints;
 
   @override
@@ -325,8 +343,6 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
       _statusMessage = '正在获取 Apple 测速配置';
       _endpoint = sanitizeEndpointHost(selectedEndpoint.host);
       _targetIpInfoRequestId++;
-      _targetIpInfo = null;
-      _usedIp = null;
       _currentMbps = 0;
       _downloadMbps = 0;
       _uploadMbps = 0;
@@ -345,6 +361,7 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
           endpointHost: selectedEndpoint.host,
           selectedIp: selectedIpOption?.address,
           dohProvider: _dohProvider,
+          bypassVpn: widget.bypassVpn,
         ),
         onProgress: _handleProgress,
       );
@@ -444,6 +461,7 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
       _downloadedBytes = progress.downloadedBytes ?? _downloadedBytes;
       _uploadedBytes = progress.uploadedBytes ?? _uploadedBytes;
       _mode = progress.mode ?? _mode;
+      _errorMessage = null;
     });
   }
 
@@ -542,28 +560,22 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
     unawaited(_refreshTargetIpInfo());
   }
 
-  Future<void> _showThemeColorPicker() async {
+  Future<void> _openSettings() async {
     if (_isRunning) {
       return;
     }
 
-    final selectedValue = await showModalBottomSheet<String>(
-      context: context,
-      useSafeArea: true,
-      showDragHandle: true,
-      builder: (context) => _ThemeColorPickerSheet(
-        colors: widget.themeColors,
-        selectedId: widget.selectedThemeColorId,
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (context) => _SettingsPage(
+          themeColors: widget.themeColors,
+          selectedThemeColorId: widget.selectedThemeColorId,
+          bypassVpn: widget.bypassVpn,
+          onThemeColorChanged: widget.onThemeColorChanged,
+          onBypassVpnChanged: widget.onBypassVpnChanged,
+        ),
       ),
     );
-
-    if (!mounted ||
-        selectedValue == null ||
-        selectedValue == widget.selectedThemeColorId) {
-      return;
-    }
-
-    widget.onThemeColorChanged(selectedValue);
   }
 
   Future<T?> _showOptionPicker<T>({
@@ -602,20 +614,18 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
           children: [
             Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
+              crossAxisAlignment: CrossAxisAlignment.center,
               children: [
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'iSpeedtest',
-                        style: theme.textTheme.headlineSmall?.copyWith(
-                          fontWeight: FontWeight.w800,
-                          height: 1.05,
-                        ),
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      'iSpeedtest',
+                      style: theme.textTheme.headlineSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                        height: 1.05,
                       ),
-                    ],
+                    ),
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -634,9 +644,9 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
                 ),
                 const SizedBox(width: 8),
                 IconButton.filledTonal(
-                  tooltip: '主题颜色',
-                  onPressed: _isRunning ? null : _showThemeColorPicker,
-                  icon: const Icon(Icons.palette_rounded),
+                  tooltip: '设置',
+                  onPressed: _isRunning ? null : _openSettings,
+                  icon: const Icon(Icons.settings_rounded),
                 ),
               ],
             ),
@@ -883,30 +893,34 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
                         ),
                       ),
                       const SizedBox(height: 12),
-                      _InfoLine(label: 'IP', value: _targetIpInfo!.query),
-                      _InfoLine(
-                        label: 'ASN',
-                        value: _targetIpInfo!.asn.isEmpty
-                            ? '未知'
-                            : _targetIpInfo!.asn,
-                      ),
-                      _InfoLine(
-                        label: 'AS Name',
-                        value: _targetIpInfo!.asName.isEmpty
-                            ? '未知'
-                            : _targetIpInfo!.asName,
-                      ),
-                      _InfoLine(
-                        label: '归属地',
-                        value: _targetIpInfo!.locationLabel,
-                      ),
-                      _InfoLine(
-                        label: 'ISP',
-                        value: _targetIpInfo!.isp.isEmpty
-                            ? (_targetIpInfo!.org.isEmpty
-                                  ? '未知'
-                                  : _targetIpInfo!.org)
-                            : _targetIpInfo!.isp,
+                      _InfoTable(
+                        rows: [
+                          _InfoRow(label: 'IP', value: _targetIpInfo!.query),
+                          _InfoRow(
+                            label: 'ASN',
+                            value: _targetIpInfo!.asn.isEmpty
+                                ? '未知'
+                                : _targetIpInfo!.asn,
+                          ),
+                          _InfoRow(
+                            label: 'AS Name',
+                            value: _targetIpInfo!.asName.isEmpty
+                                ? '未知'
+                                : _targetIpInfo!.asName,
+                          ),
+                          _InfoRow(
+                            label: '归属地',
+                            value: _targetIpInfo!.locationLabel,
+                          ),
+                          _InfoRow(
+                            label: 'ISP',
+                            value: _targetIpInfo!.isp.isEmpty
+                                ? (_targetIpInfo!.org.isEmpty
+                                      ? '未知'
+                                      : _targetIpInfo!.org)
+                                : _targetIpInfo!.isp,
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -983,10 +997,6 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
       return null;
     }
 
-    if (_heroEndpointHost == usedIp || _endpoint.contains(usedIp)) {
-      return null;
-    }
-
     return usedIp;
   }
 
@@ -1014,98 +1024,209 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
   }
 }
 
-class _ThemeColorPickerSheet extends StatelessWidget {
-  const _ThemeColorPickerSheet({
-    required this.colors,
-    required this.selectedId,
+class _SettingsPage extends StatefulWidget {
+  const _SettingsPage({
+    required this.themeColors,
+    required this.selectedThemeColorId,
+    required this.bypassVpn,
+    required this.onThemeColorChanged,
+    required this.onBypassVpnChanged,
   });
 
-  final List<AppThemeColor> colors;
-  final String selectedId;
+  final List<AppThemeColor> themeColors;
+  final String selectedThemeColorId;
+  final bool bypassVpn;
+  final ValueChanged<String> onThemeColorChanged;
+  final ValueChanged<bool> onBypassVpnChanged;
+
+  @override
+  State<_SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<_SettingsPage> {
+  static const String _githubUrl = 'https://github.com/watchdogexd/iSpeedtest';
+
+  late String _selectedThemeColorId;
+  late bool _bypassVpn;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedThemeColorId = widget.selectedThemeColorId;
+    _bypassVpn = widget.bypassVpn;
+  }
+
+  void _selectThemeColor(String id) {
+    if (id == _selectedThemeColorId) {
+      return;
+    }
+    setState(() {
+      _selectedThemeColorId = id;
+    });
+    widget.onThemeColorChanged(id);
+  }
+
+  void _setBypassVpn(bool value) {
+    if (value == _bypassVpn) {
+      return;
+    }
+    setState(() {
+      _bypassVpn = value;
+    });
+    widget.onBypassVpnChanged(value);
+  }
+
+  Future<void> _copyGithubUrl() async {
+    await Clipboard.setData(const ClipboardData(text: _githubUrl));
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('GitHub 地址已复制')));
+  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
 
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            '主题颜色',
-            style: theme.textTheme.titleLarge?.copyWith(
-              fontWeight: FontWeight.w800,
-              height: 1.1,
-            ),
-          ),
-          const SizedBox(height: 18),
-          Wrap(
-            spacing: 14,
-            runSpacing: 14,
-            children: colors.map((option) {
-              final isSelected = option.id == selectedId;
-              final foreground =
-                  ThemeData.estimateBrightnessForColor(option.color) ==
-                      Brightness.dark
-                  ? Colors.white
-                  : Colors.black;
+    return Scaffold(
+      backgroundColor: theme.scaffoldBackgroundColor,
+      appBar: AppBar(
+        backgroundColor: theme.scaffoldBackgroundColor,
+        title: const Text('设置'),
+      ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+          children: [
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(18),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '主题颜色',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                        height: 1.15,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Wrap(
+                      spacing: 14,
+                      runSpacing: 14,
+                      children: widget.themeColors.map((option) {
+                        final isSelected = option.id == _selectedThemeColorId;
+                        final foreground =
+                            ThemeData.estimateBrightnessForColor(
+                                  option.color,
+                                ) ==
+                                Brightness.dark
+                            ? Colors.white
+                            : Colors.black;
 
-              return Tooltip(
-                message: option.label,
-                child: Semantics(
-                  button: true,
-                  selected: isSelected,
-                  label: '主题颜色 ${option.label}',
-                  child: Material(
-                    color: Colors.transparent,
-                    shape: const CircleBorder(),
-                    child: InkWell(
-                      customBorder: const CircleBorder(),
-                      onTap: () => Navigator.of(context).pop(option.id),
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 160),
-                        curve: Curves.easeOutCubic,
-                        width: 48,
-                        height: 48,
-                        decoration: BoxDecoration(
-                          color: option.color,
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            width: isSelected ? 3 : 1,
-                            color: isSelected
-                                ? colorScheme.onSurface
-                                : colorScheme.outlineVariant,
-                          ),
-                          boxShadow: isSelected
-                              ? [
-                                  BoxShadow(
-                                    color: option.color.withValues(alpha: 0.35),
-                                    blurRadius: 16,
-                                    spreadRadius: 1,
+                        return Tooltip(
+                          message: option.label,
+                          child: Semantics(
+                            button: true,
+                            selected: isSelected,
+                            label: '主题颜色 ${option.label}',
+                            child: Material(
+                              color: Colors.transparent,
+                              shape: const CircleBorder(),
+                              child: InkWell(
+                                customBorder: const CircleBorder(),
+                                onTap: () => _selectThemeColor(option.id),
+                                child: AnimatedContainer(
+                                  duration: const Duration(milliseconds: 160),
+                                  curve: Curves.easeOutCubic,
+                                  width: 48,
+                                  height: 48,
+                                  decoration: BoxDecoration(
+                                    color: option.color,
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                      width: isSelected ? 3 : 1,
+                                      color: isSelected
+                                          ? colorScheme.onSurface
+                                          : colorScheme.outlineVariant,
+                                    ),
+                                    boxShadow: isSelected
+                                        ? [
+                                            BoxShadow(
+                                              color: option.color.withValues(
+                                                alpha: 0.35,
+                                              ),
+                                              blurRadius: 16,
+                                              spreadRadius: 1,
+                                            ),
+                                          ]
+                                        : null,
                                   ),
-                                ]
-                              : null,
-                        ),
-                        child: AnimatedOpacity(
-                          duration: const Duration(milliseconds: 120),
-                          opacity: isSelected ? 1 : 0,
-                          child: Icon(
-                            Icons.check_rounded,
-                            color: foreground,
-                            size: 24,
+                                  child: AnimatedOpacity(
+                                    duration: const Duration(milliseconds: 120),
+                                    opacity: isSelected ? 1 : 0,
+                                    child: Icon(
+                                      Icons.check_rounded,
+                                      color: foreground,
+                                      size: 24,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
                           ),
-                        ),
+                        );
+                      }).toList(),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Card(
+              child: SwitchListTile(
+                value: _bypassVpn,
+                onChanged: _setBypassVpn,
+                title: const Text('绕过 VPN'),
+                subtitle: const Text('测速时尝试绑定到非 VPN 网络'),
+                secondary: Icon(
+                  Icons.vpn_lock_rounded,
+                  color: colorScheme.primary,
+                ),
+              ),
+            ),
+            const SizedBox(height: 28),
+            Center(
+              child: Column(
+                children: [
+                  Text(
+                    'iSpeedtest v1.0.1@watchdogexd',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                      height: 1.25,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  TextButton.icon(
+                    onPressed: _copyGithubUrl,
+                    icon: const Icon(Icons.code_rounded, size: 16),
+                    label: const Text(_githubUrl),
+                    style: TextButton.styleFrom(
+                      foregroundColor: colorScheme.onSurfaceVariant,
+                      textStyle: theme.textTheme.bodySmall?.copyWith(
+                        height: 1.25,
                       ),
                     ),
                   ),
-                ),
-              );
-            }).toList(),
-          ),
-        ],
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1708,41 +1829,53 @@ class _AddNodeSheetState extends State<_AddNodeSheet> {
   }
 }
 
-class _InfoLine extends StatelessWidget {
-  const _InfoLine({required this.label, required this.value});
+class _InfoRow {
+  const _InfoRow({required this.label, required this.value});
 
   final String label;
   final String value;
+}
+
+class _InfoTable extends StatelessWidget {
+  const _InfoTable({required this.rows});
+
+  final List<_InfoRow> rows;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
 
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 72,
-            child: Text(
-              label,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: colorScheme.onSurfaceVariant,
+    return Table(
+      columnWidths: const {0: FixedColumnWidth(76), 1: FlexColumnWidth()},
+      defaultVerticalAlignment: TableCellVerticalAlignment.top,
+      children: rows.map((row) {
+        return TableRow(
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(right: 12, bottom: 8),
+              child: Text(
+                row.label,
+                textAlign: TextAlign.right,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: colorScheme.onSurfaceVariant,
+                  height: 1.25,
+                ),
               ),
             ),
-          ),
-          Expanded(
-            child: Text(
-              value,
-              style: theme.textTheme.bodyMedium?.copyWith(
-                fontWeight: FontWeight.w600,
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(
+                row.value,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                  height: 1.25,
+                ),
               ),
             ),
-          ),
-        ],
-      ),
+          ],
+        );
+      }).toList(),
     );
   }
 }

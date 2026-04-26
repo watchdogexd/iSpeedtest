@@ -78,6 +78,17 @@ void main() {
       expect(config.uploadUri.host, defaultSpeedTestEndpointHost);
     });
 
+    test('does not bypass vpn by default', () {
+      const options = SpeedTestOptions(
+        mode: SpeedTestMode.singleThread,
+        endpointHost: defaultSpeedTestEndpointHost,
+        selectedIp: null,
+        dohProvider: DohProvider.google,
+      );
+
+      expect(options.bypassVpn, isFalse);
+    });
+
     test('measures upload throughput for each mode', () async {
       final harness = await _UploadTestHarness.start();
       addTearDown(harness.close);
@@ -175,7 +186,7 @@ void main() {
       expect(harness.serverRejectedBytes, greaterThan(0));
       expect(
         result.uploadedBytes,
-        lessThan(harness.serverAcceptedBytes + harness.serverRejectedBytes),
+        harness.serverAcceptedBytes + harness.serverRejectedBytes,
       );
       expect(result.uploadMbps, greaterThan(0));
       expect(progressUpdates.last.statusMessage, '上传测速完成 · 2 次网络波动');

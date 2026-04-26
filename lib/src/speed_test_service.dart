@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import 'speed_test_models.dart';
+import 'speed_test_network_binding.dart';
 
 class SpeedTestService {
   static const String _userAgent =
@@ -20,10 +21,11 @@ class SpeedTestService {
   static const Duration _uploadGraceDuration = Duration(seconds: 2);
   static const Duration _uploadProgressInterval = Duration(milliseconds: 500);
 
-  SpeedTestService()
+  SpeedTestService({SpeedTestNetworkBinding? networkBinding})
     : _uploadDurationOverride = null,
       _uploadGraceDurationOverride = null,
-      _resolveHostWithDohOverride = null;
+      _resolveHostWithDohOverride = null,
+      _networkBinding = networkBinding ?? SpeedTestNetworkBinding();
 
   @visibleForTesting
   SpeedTestService.test({
@@ -31,15 +33,18 @@ class SpeedTestService {
     Duration? uploadGraceDuration,
     Future<DohResolution> Function(String host, DohProvider provider)?
     resolveHostWithDoh,
+    SpeedTestNetworkBinding? networkBinding,
   }) : _uploadDurationOverride = uploadDuration,
        _uploadGraceDurationOverride = uploadGraceDuration,
-       _resolveHostWithDohOverride = resolveHostWithDoh;
+       _resolveHostWithDohOverride = resolveHostWithDoh,
+       _networkBinding = networkBinding ?? NoopSpeedTestNetworkBinding();
 
   final List<HttpClient> _activeClients = <HttpClient>[];
   final Duration? _uploadDurationOverride;
   final Duration? _uploadGraceDurationOverride;
   final Future<DohResolution> Function(String host, DohProvider provider)?
   _resolveHostWithDohOverride;
+  final SpeedTestNetworkBinding _networkBinding;
   bool _cancelRequested = false;
 
   Duration get _configuredUploadDuration =>
@@ -115,76 +120,88 @@ class SpeedTestService {
     required void Function(SpeedTestProgress progress) onProgress,
   }) async {
     _cancelRequested = false;
+    final networkBindingLease = options.bypassVpn
+        ? await _networkBinding.bindToNonVpnNetwork()
+        : SpeedTestNetworkBindingLease.noop();
 
-    onProgress(
-      SpeedTestProgress(
-        phase: SpeedTestPhase.preparing,
-        statusMessage: '正在获取 Apple 测速配置',
+    try {
+      onProgress(
+        SpeedTestProgress(
+          phase: SpeedTestPhase.preparing,
+          statusMessage: options.bypassVpn && networkBindingLease.didBind
+              ? '已绕过 VPN · ${networkBindingLease.diagnostic ?? '非 VPN 网络'}'
+              : '正在获取 Apple 测速配置',
+          mode: options.mode,
+          phaseProgress: 0.15,
+          overallProgress: 0.03,
+        ),
+      );
+
+      final config = (await _fetchConfig()).copyWithEndpoint(
+        sanitizeEndpointHost(options.endpointHost),
+      );
+      final preferredAutoIp =
+          options.selectedIp ??
+          await _resolvePreferredAutoIp(
+            config.testEndpoint,
+            options.dohProvider,
+          );
+      _throwIfCancelled();
+      final warmUpUsedIp = await _warmUp(config, preferredAutoIp);
+      _throwIfCancelled();
+
+      onProgress(
+        SpeedTestProgress(
+          phase: SpeedTestPhase.preparing,
+          statusMessage: options.selectedIp != null
+              ? '测速节点已就绪，固定 IP ${options.selectedIp}'
+              : (preferredAutoIp != null
+                    ? '测速节点已就绪，自动使用${options.dohProvider.label} DoH IP $preferredAutoIp'
+                    : '测速节点已就绪'),
+          endpoint: sanitizeEndpointHost(config.testEndpoint),
+          usedIp: warmUpUsedIp ?? preferredAutoIp,
+          mode: options.mode,
+          phaseProgress: 1,
+          overallProgress: 0.08,
+        ),
+      );
+
+      final downloadSample = await _measureDownload(
+        config: config,
         mode: options.mode,
-        phaseProgress: 0.15,
-        overallProgress: 0.03,
-      ),
-    );
+        selectedIp: preferredAutoIp,
+        onProgress: onProgress,
+      );
 
-    final config = (await _fetchConfig()).copyWithEndpoint(
-      sanitizeEndpointHost(options.endpointHost),
-    );
-    final preferredAutoIp =
-        options.selectedIp ??
-        await _resolvePreferredAutoIp(config.testEndpoint, options.dohProvider);
-    _throwIfCancelled();
-    final warmUpUsedIp = await _warmUp(config, preferredAutoIp);
-    _throwIfCancelled();
+      _throwIfCancelled();
 
-    onProgress(
-      SpeedTestProgress(
-        phase: SpeedTestPhase.preparing,
-        statusMessage: options.selectedIp != null
-            ? '测速节点已就绪，固定 IP ${options.selectedIp}'
-            : (preferredAutoIp != null
-                  ? '测速节点已就绪，自动使用${options.dohProvider.label} DoH IP $preferredAutoIp'
-                  : '测速节点已就绪'),
+      final uploadSample = await _measureUpload(
+        config: config,
+        mode: options.mode,
+        selectedIp: preferredAutoIp,
+        downloadMbps: downloadSample.mbps,
+        downloadedBytes: downloadSample.bytes,
+        onProgress: onProgress,
+      );
+      _throwIfCancelled();
+
+      return SpeedTestResult(
         endpoint: sanitizeEndpointHost(config.testEndpoint),
-        usedIp: warmUpUsedIp ?? preferredAutoIp,
         mode: options.mode,
-        phaseProgress: 1,
-        overallProgress: 0.08,
-      ),
-    );
-
-    final downloadSample = await _measureDownload(
-      config: config,
-      mode: options.mode,
-      selectedIp: preferredAutoIp,
-      onProgress: onProgress,
-    );
-
-    _throwIfCancelled();
-
-    final uploadSample = await _measureUpload(
-      config: config,
-      mode: options.mode,
-      selectedIp: preferredAutoIp,
-      downloadMbps: downloadSample.mbps,
-      downloadedBytes: downloadSample.bytes,
-      onProgress: onProgress,
-    );
-    _throwIfCancelled();
-
-    return SpeedTestResult(
-      endpoint: sanitizeEndpointHost(config.testEndpoint),
-      mode: options.mode,
-      downloadMbps: downloadSample.mbps,
-      uploadMbps: uploadSample.mbps,
-      downloadedBytes: downloadSample.bytes,
-      uploadedBytes: uploadSample.bytes,
-      finishedAt: DateTime.now(),
-      usedIp:
-          downloadSample.usedIp ??
-          uploadSample.usedIp ??
-          warmUpUsedIp ??
-          preferredAutoIp,
-    );
+        downloadMbps: downloadSample.mbps,
+        uploadMbps: uploadSample.mbps,
+        downloadedBytes: downloadSample.bytes,
+        uploadedBytes: uploadSample.bytes,
+        finishedAt: DateTime.now(),
+        usedIp:
+            downloadSample.usedIp ??
+            uploadSample.usedIp ??
+            warmUpUsedIp ??
+            preferredAutoIp,
+      );
+    } finally {
+      await networkBindingLease.restore();
+    }
   }
 
   void cancel() {
@@ -538,7 +555,7 @@ class SpeedTestService {
         return;
       }
 
-      if (totalUploadedBytes == 0 && uploadFaultCount > 0) {
+      if (uploadFaultCount >= mode.connections) {
         completer.completeError(
           StateError('Upload failed after $uploadFaultCount network faults'),
         );
@@ -590,7 +607,6 @@ class SpeedTestService {
 
     for (var index = 0; index < mode.connections; index++) {
       unawaited(() async {
-        var workerBytes = 0;
         final client = _createClient(
           overrideHost: config.testEndpoint,
           overrideIp: selectedIp,
@@ -607,7 +623,6 @@ class SpeedTestService {
             responseTimeout: responseTimeout,
             mode: mode,
             onChunkConsumed: (bytes) {
-              workerBytes += bytes;
               totalUploadedBytes += bytes;
             },
           );
@@ -616,10 +631,6 @@ class SpeedTestService {
 
           if (uploadResult.faulted) {
             uploadFaultCount++;
-            totalUploadedBytes = (totalUploadedBytes - workerBytes).clamp(
-              0,
-              totalUploadedBytes,
-            );
           }
 
           if (uploadResult.bytes <= 0 && stopwatch.elapsed < duration) {
@@ -745,7 +756,11 @@ class SpeedTestService {
       final response = await request.close().timeout(responseTimeout);
       final usedIp = response.connectionInfo?.remoteAddress.address;
       if (response.statusCode >= 400) {
-        return _UploadRequestResult(bytes: 0, usedIp: usedIp, faulted: true);
+        return _UploadRequestResult(
+          bytes: consumedBytes,
+          usedIp: usedIp,
+          faulted: true,
+        );
       }
 
       final drainTimeout = responseTimeout - responseStopwatch.elapsed;

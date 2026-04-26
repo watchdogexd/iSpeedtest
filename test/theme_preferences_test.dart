@@ -35,9 +35,33 @@ void main() {
     expect(savedCall?.arguments, 'green');
   });
 
+  test('loads bypass vpn setting', () async {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'getBypassVpn');
+      return true;
+    });
+
+    expect(await const ThemePreferences().loadBypassVpn(), isTrue);
+  });
+
+  test('saves bypass vpn setting', () async {
+    MethodCall? savedCall;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      savedCall = call;
+      return null;
+    });
+
+    await const ThemePreferences().saveBypassVpn(true);
+
+    expect(savedCall?.method, 'setBypassVpn');
+    expect(savedCall?.arguments, isTrue);
+  });
+
   test('ignores missing platform storage', () async {
     expect(await const ThemePreferences().loadThemeColorId(), isNull);
+    expect(await const ThemePreferences().loadBypassVpn(), isFalse);
 
     await const ThemePreferences().saveThemeColorId('purple');
+    await const ThemePreferences().saveBypassVpn(true);
   });
 }

@@ -4,20 +4,79 @@ import 'package:flutter/material.dart';
 
 import 'src/speed_test_models.dart';
 import 'src/speed_test_service.dart';
+import 'src/theme_preferences.dart';
 
-void main() {
-  runApp(const AppleSpeedApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  final themePreferences = ThemePreferences();
+  final initialThemeColorId = await themePreferences.loadThemeColorId();
+  runApp(
+    AppleSpeedApp(
+      initialThemeColorId: _resolveThemeColorId(initialThemeColorId),
+      themePreferences: themePreferences,
+    ),
+  );
 }
 
-class AppleSpeedApp extends StatelessWidget {
-  const AppleSpeedApp({super.key, this.service, this.autoLoadEndpoints = true});
+const List<AppThemeColor> appThemeColors = <AppThemeColor>[
+  AppThemeColor(id: 'teal', label: '青绿', color: Color(0xFF0B6E6E)),
+  AppThemeColor(id: 'blue', label: '蓝色', color: Color(0xFF0061A4)),
+  AppThemeColor(id: 'green', label: '绿色', color: Color(0xFF386A20)),
+  AppThemeColor(id: 'purple', label: '紫色', color: Color(0xFF6750A4)),
+  AppThemeColor(id: 'orange', label: '橙色', color: Color(0xFFB55D00)),
+  AppThemeColor(id: 'rose', label: '玫红', color: Color(0xFFB3261E)),
+];
+
+class AppThemeColor {
+  const AppThemeColor({
+    required this.id,
+    required this.label,
+    required this.color,
+  });
+
+  final String id;
+  final String label;
+  final Color color;
+}
+
+class AppleSpeedApp extends StatefulWidget {
+  const AppleSpeedApp({
+    super.key,
+    this.service,
+    this.autoLoadEndpoints = true,
+    this.initialThemeColorId,
+    this.themePreferences = const ThemePreferences(),
+  });
 
   final SpeedTestService? service;
   final bool autoLoadEndpoints;
+  final String? initialThemeColorId;
+  final ThemePreferences themePreferences;
+
+  @override
+  State<AppleSpeedApp> createState() => _AppleSpeedAppState();
+}
+
+class _AppleSpeedAppState extends State<AppleSpeedApp> {
+  late String _selectedThemeColorId;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedThemeColorId = _resolveThemeColorId(widget.initialThemeColorId);
+  }
+
+  AppThemeColor get _selectedThemeColor {
+    return appThemeColors.firstWhere(
+      (option) => option.id == _selectedThemeColorId,
+      orElse: () => appThemeColors.first,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    const seedColor = Color(0xFF0B6E6E);
+    final seedColor = _selectedThemeColor.color;
     final colorScheme =
         ColorScheme.fromSeed(
           seedColor: seedColor,
@@ -30,7 +89,7 @@ class AppleSpeedApp extends StatelessWidget {
         );
 
     return MaterialApp(
-      title: 'Apple CDN Speed Test',
+      title: 'iSpeedtest',
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.dark,
       theme: ThemeData(
@@ -60,21 +119,47 @@ class AppleSpeedApp extends StatelessWidget {
         ),
       ),
       home: SpeedTestPage(
-        service: service ?? SpeedTestService(),
-        autoLoadEndpoints: autoLoadEndpoints,
+        service: widget.service ?? SpeedTestService(),
+        autoLoadEndpoints: widget.autoLoadEndpoints,
+        themeColors: appThemeColors,
+        selectedThemeColorId: _selectedThemeColorId,
+        onThemeColorChanged: (id) {
+          final themeColorId = _resolveThemeColorId(id);
+          setState(() {
+            _selectedThemeColorId = themeColorId;
+          });
+          unawaited(widget.themePreferences.saveThemeColorId(themeColorId));
+        },
       ),
     );
   }
+}
+
+String _resolveThemeColorId(String? themeColorId) {
+  if (themeColorId == null) {
+    return appThemeColors.first.id;
+  }
+
+  final normalizedThemeColorId = themeColorId.trim();
+  return appThemeColors.any((option) => option.id == normalizedThemeColorId)
+      ? normalizedThemeColorId
+      : appThemeColors.first.id;
 }
 
 class SpeedTestPage extends StatefulWidget {
   const SpeedTestPage({
     super.key,
     required this.service,
+    required this.themeColors,
+    required this.selectedThemeColorId,
+    required this.onThemeColorChanged,
     this.autoLoadEndpoints = true,
   });
 
   final SpeedTestService service;
+  final List<AppThemeColor> themeColors;
+  final String selectedThemeColorId;
+  final ValueChanged<String> onThemeColorChanged;
   final bool autoLoadEndpoints;
 
   @override
@@ -259,6 +344,7 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
           mode: _mode,
           endpointHost: selectedEndpoint.host,
           selectedIp: selectedIpOption?.address,
+          dohProvider: _dohProvider,
         ),
         onProgress: _handleProgress,
       );
@@ -456,6 +542,30 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
     unawaited(_refreshTargetIpInfo());
   }
 
+  Future<void> _showThemeColorPicker() async {
+    if (_isRunning) {
+      return;
+    }
+
+    final selectedValue = await showModalBottomSheet<String>(
+      context: context,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (context) => _ThemeColorPickerSheet(
+        colors: widget.themeColors,
+        selectedId: widget.selectedThemeColorId,
+      ),
+    );
+
+    if (!mounted ||
+        selectedValue == null ||
+        selectedValue == widget.selectedThemeColorId) {
+      return;
+    }
+
+    widget.onThemeColorChanged(selectedValue);
+  }
+
   Future<T?> _showOptionPicker<T>({
     required String title,
     required T? selectedValue,
@@ -499,7 +609,7 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Apple CDN Speed Test',
+                        'iSpeedtest',
                         style: theme.textTheme.headlineSmall?.copyWith(
                           fontWeight: FontWeight.w800,
                           height: 1.05,
@@ -521,6 +631,12 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
                   tooltip: '添加节点',
                   onPressed: _isRunning ? null : _showAddNodeDialog,
                   icon: const Icon(Icons.add_link_rounded),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filledTonal(
+                  tooltip: '主题颜色',
+                  onPressed: _isRunning ? null : _showThemeColorPicker,
+                  icon: const Icon(Icons.palette_rounded),
                 ),
               ],
             ),
@@ -867,7 +983,7 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
       return null;
     }
 
-    if (_heroEndpointHost == usedIp) {
+    if (_heroEndpointHost == usedIp || _endpoint.contains(usedIp)) {
       return null;
     }
 
@@ -895,6 +1011,103 @@ class _SpeedTestPageState extends State<SpeedTestPage> {
     final mm = time.minute.toString().padLeft(2, '0');
     final ss = time.second.toString().padLeft(2, '0');
     return '$hh:$mm:$ss';
+  }
+}
+
+class _ThemeColorPickerSheet extends StatelessWidget {
+  const _ThemeColorPickerSheet({
+    required this.colors,
+    required this.selectedId,
+  });
+
+  final List<AppThemeColor> colors;
+  final String selectedId;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '主题颜色',
+            style: theme.textTheme.titleLarge?.copyWith(
+              fontWeight: FontWeight.w800,
+              height: 1.1,
+            ),
+          ),
+          const SizedBox(height: 18),
+          Wrap(
+            spacing: 14,
+            runSpacing: 14,
+            children: colors.map((option) {
+              final isSelected = option.id == selectedId;
+              final foreground =
+                  ThemeData.estimateBrightnessForColor(option.color) ==
+                      Brightness.dark
+                  ? Colors.white
+                  : Colors.black;
+
+              return Tooltip(
+                message: option.label,
+                child: Semantics(
+                  button: true,
+                  selected: isSelected,
+                  label: '主题颜色 ${option.label}',
+                  child: Material(
+                    color: Colors.transparent,
+                    shape: const CircleBorder(),
+                    child: InkWell(
+                      customBorder: const CircleBorder(),
+                      onTap: () => Navigator.of(context).pop(option.id),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 160),
+                        curve: Curves.easeOutCubic,
+                        width: 48,
+                        height: 48,
+                        decoration: BoxDecoration(
+                          color: option.color,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            width: isSelected ? 3 : 1,
+                            color: isSelected
+                                ? colorScheme.onSurface
+                                : colorScheme.outlineVariant,
+                          ),
+                          boxShadow: isSelected
+                              ? [
+                                  BoxShadow(
+                                    color: option.color.withValues(alpha: 0.35),
+                                    blurRadius: 16,
+                                    spreadRadius: 1,
+                                  ),
+                                ]
+                              : null,
+                        ),
+                        child: AnimatedOpacity(
+                          duration: const Duration(milliseconds: 120),
+                          opacity: isSelected ? 1 : 0,
+                          child: Icon(
+                            Icons.check_rounded,
+                            color: foreground,
+                            size: 24,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        ],
+      ),
+    );
   }
 }
 

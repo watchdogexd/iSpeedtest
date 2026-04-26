@@ -3,9 +3,13 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
+
 import 'speed_test_models.dart';
 
 class SpeedTestService {
+  static const String _userAgent =
+      'networkQuality/194.80.3 CFNetwork/3860.400.51 Darwin/25.3.0';
   static final Uri _configUri = Uri.parse(
     'https://mensura.cdn-apple.com/api/v1/gm/config',
   );
@@ -14,9 +18,35 @@ class SpeedTestService {
   static const Duration _downloadDuration = Duration(seconds: 8);
   static const Duration _uploadDuration = Duration(seconds: 8);
   static const Duration _uploadGraceDuration = Duration(seconds: 2);
+  static const Duration _uploadProgressInterval = Duration(milliseconds: 500);
+
+  SpeedTestService()
+    : _uploadDurationOverride = null,
+      _uploadGraceDurationOverride = null,
+      _resolveHostWithDohOverride = null;
+
+  @visibleForTesting
+  SpeedTestService.test({
+    Duration? uploadDuration,
+    Duration? uploadGraceDuration,
+    Future<DohResolution> Function(String host, DohProvider provider)?
+    resolveHostWithDoh,
+  }) : _uploadDurationOverride = uploadDuration,
+       _uploadGraceDurationOverride = uploadGraceDuration,
+       _resolveHostWithDohOverride = resolveHostWithDoh;
 
   final List<HttpClient> _activeClients = <HttpClient>[];
+  final Duration? _uploadDurationOverride;
+  final Duration? _uploadGraceDurationOverride;
+  final Future<DohResolution> Function(String host, DohProvider provider)?
+  _resolveHostWithDohOverride;
   bool _cancelRequested = false;
+
+  Duration get _configuredUploadDuration =>
+      _uploadDurationOverride ?? _uploadDuration;
+
+  Duration get _configuredUploadGraceDuration =>
+      _uploadGraceDurationOverride ?? _uploadGraceDuration;
 
   Future<SpeedTestBootstrap> bootstrap({
     required DohProvider provider,
@@ -25,7 +55,7 @@ class SpeedTestService {
     _cancelRequested = false;
     final config = await _fetchConfig();
 
-    final hostSet = <String>{sanitizeEndpointHost('mensura.cdn-apple.com')};
+    final hostSet = <String>{defaultSpeedTestEndpointHost};
 
     for (final host in customHosts) {
       final normalized = normalizeHost(host);
@@ -41,16 +71,16 @@ class SpeedTestService {
         SpeedTestEndpointOption(
           id: host,
           label: switch (host) {
-            'mensura.cdn-apple.com' => '默认入口节点',
+            defaultSpeedTestEndpointHost => '默认入口节点',
             _ => '自定义节点',
           },
           host: host,
           description: switch (host) {
-            'mensura.cdn-apple.com' => '使用 Apple 默认入口域名测速',
+            defaultSpeedTestEndpointHost => '使用 Apple 默认入口域名测速',
             _ => '用户手动添加的测速节点',
           },
           resolution: resolution,
-          isCustom: host != 'mensura.cdn-apple.com',
+          isCustom: host != defaultSpeedTestEndpointHost,
         ),
       );
     }
@@ -99,18 +129,23 @@ class SpeedTestService {
     final config = (await _fetchConfig()).copyWithEndpoint(
       sanitizeEndpointHost(options.endpointHost),
     );
+    final preferredAutoIp =
+        options.selectedIp ??
+        await _resolvePreferredAutoIp(config.testEndpoint, options.dohProvider);
     _throwIfCancelled();
-    final warmUpUsedIp = await _warmUp(config, options.selectedIp);
+    final warmUpUsedIp = await _warmUp(config, preferredAutoIp);
     _throwIfCancelled();
 
     onProgress(
       SpeedTestProgress(
         phase: SpeedTestPhase.preparing,
-        statusMessage: options.selectedIp == null
-            ? '测速节点已就绪'
-            : '测速节点已就绪，固定 IP ${options.selectedIp}',
+        statusMessage: options.selectedIp != null
+            ? '测速节点已就绪，固定 IP ${options.selectedIp}'
+            : (preferredAutoIp != null
+                  ? '测速节点已就绪，自动使用${options.dohProvider.label} DoH IP $preferredAutoIp'
+                  : '测速节点已就绪'),
         endpoint: sanitizeEndpointHost(config.testEndpoint),
-        usedIp: warmUpUsedIp ?? options.selectedIp,
+        usedIp: warmUpUsedIp ?? preferredAutoIp,
         mode: options.mode,
         phaseProgress: 1,
         overallProgress: 0.08,
@@ -120,7 +155,7 @@ class SpeedTestService {
     final downloadSample = await _measureDownload(
       config: config,
       mode: options.mode,
-      selectedIp: options.selectedIp,
+      selectedIp: preferredAutoIp,
       onProgress: onProgress,
     );
 
@@ -129,7 +164,7 @@ class SpeedTestService {
     final uploadSample = await _measureUpload(
       config: config,
       mode: options.mode,
-      selectedIp: options.selectedIp,
+      selectedIp: preferredAutoIp,
       downloadMbps: downloadSample.mbps,
       downloadedBytes: downloadSample.bytes,
       onProgress: onProgress,
@@ -145,10 +180,10 @@ class SpeedTestService {
       uploadedBytes: uploadSample.bytes,
       finishedAt: DateTime.now(),
       usedIp:
-          options.selectedIp ??
-          warmUpUsedIp ??
           downloadSample.usedIp ??
-          uploadSample.usedIp,
+          uploadSample.usedIp ??
+          warmUpUsedIp ??
+          preferredAutoIp,
     );
   }
 
@@ -158,6 +193,45 @@ class SpeedTestService {
       client.close(force: true);
     }
     _activeClients.clear();
+  }
+
+  @visibleForTesting
+  Future<SpeedTestResult> measureUploadForTesting({
+    required SpeedTestConfig config,
+    required SpeedTestMode mode,
+    String? selectedIp,
+    double downloadMbps = 0,
+    int downloadedBytes = 0,
+    void Function(SpeedTestProgress progress)? onProgress,
+  }) async {
+    _cancelRequested = false;
+    final sample = await _measureUpload(
+      config: config,
+      mode: mode,
+      selectedIp: selectedIp,
+      downloadMbps: downloadMbps,
+      downloadedBytes: downloadedBytes,
+      onProgress: onProgress ?? (_) {},
+    );
+
+    return SpeedTestResult(
+      endpoint: sanitizeEndpointHost(config.testEndpoint),
+      mode: mode,
+      downloadMbps: downloadMbps,
+      uploadMbps: sample.mbps,
+      downloadedBytes: downloadedBytes,
+      uploadedBytes: sample.bytes,
+      finishedAt: DateTime.now(),
+      usedIp: sample.usedIp,
+    );
+  }
+
+  @visibleForTesting
+  Future<String?> resolvePreferredAutoIpForTesting(
+    String endpointHost,
+    DohProvider provider,
+  ) {
+    return _resolvePreferredAutoIp(endpointHost, provider);
   }
 
   static String? normalizeHost(String input) {
@@ -264,6 +338,18 @@ class SpeedTestService {
     } finally {
       _closeClient(client);
     }
+  }
+
+  Future<String?> _resolvePreferredAutoIp(
+    String endpointHost,
+    DohProvider provider,
+  ) async {
+    if (_isValidIpAddress(endpointHost)) {
+      return endpointHost;
+    }
+
+    final resolution = await _resolveHostWithDoh(endpointHost, provider);
+    return resolution.ipv4.firstOrNull ?? resolution.ipv6.firstOrNull;
   }
 
   Future<_ThroughputSample> _measureDownload({
@@ -422,17 +508,18 @@ class SpeedTestService {
     required int downloadedBytes,
     required void Function(SpeedTestProgress progress) onProgress,
   }) async {
-    const duration = _uploadDuration;
-    final hardDuration = duration + _uploadGraceDuration;
+    final duration = _configuredUploadDuration;
+    final responseTimeout = _configuredUploadGraceDuration;
+    final uploadWriteTimeout = duration + responseTimeout;
     final stopwatch = Stopwatch()..start();
     final completer = Completer<_ThroughputSample>();
     final clients = <HttpClient>[];
     var totalUploadedBytes = 0;
+    var uploadFaultCount = 0;
     var finishedWorkers = 0;
     Object? firstError;
     StackTrace? firstStackTrace;
     Timer? ticker;
-    Timer? hardStopTimer;
     String? resolvedIp;
 
     Future<void> completeWithSample() async {
@@ -441,7 +528,6 @@ class SpeedTestService {
       }
 
       ticker?.cancel();
-      hardStopTimer?.cancel();
       stopwatch.stop();
       for (final client in clients) {
         _closeClient(client);
@@ -452,14 +538,19 @@ class SpeedTestService {
         return;
       }
 
+      if (totalUploadedBytes == 0 && uploadFaultCount > 0) {
+        completer.completeError(
+          StateError('Upload failed after $uploadFaultCount network faults'),
+        );
+        return;
+      }
+
       if (totalUploadedBytes == 0 && firstError != null) {
         completer.completeError(firstError!, firstStackTrace);
         return;
       }
 
-      final effectiveElapsed = stopwatch.elapsed > duration
-          ? duration
-          : stopwatch.elapsed;
+      final effectiveElapsed = _uploadElapsed(stopwatch.elapsed, duration);
       completer.complete(
         _ThroughputSample(
           mbps: _bytesToMbps(totalUploadedBytes, effectiveElapsed),
@@ -469,31 +560,24 @@ class SpeedTestService {
       );
     }
 
-    ticker = Timer.periodic(const Duration(milliseconds: 500), (_) {
+    ticker = Timer.periodic(_uploadProgressInterval, (_) {
       if (_cancelRequested) {
         ticker?.cancel();
         return;
       }
-      final elapsed = stopwatch.elapsed;
-      final displayElapsed = elapsed > duration ? duration : elapsed;
+      final displayElapsed = _uploadElapsed(stopwatch.elapsed, duration);
       final phaseProgress = _progressForElapsed(displayElapsed, duration);
-      final currentMbps = _bytesToMbps(
-        totalUploadedBytes,
-        _uploadDisplayElapsed(elapsed, mode),
-      );
-      final endpointDisplay = sanitizeEndpointHost(config.testEndpoint);
+      final currentMbps = _bytesToMbps(totalUploadedBytes, displayElapsed);
       onProgress(
-        SpeedTestProgress(
-          phase: SpeedTestPhase.uploading,
-          statusMessage: '上传测速中 · ${mode.label}',
-          endpoint: endpointDisplay,
-          usedIp: resolvedIp ?? selectedIp,
-          currentMbps: currentMbps,
+        _uploadProgress(
+          config: config,
+          mode: mode,
+          selectedIp: resolvedIp ?? selectedIp,
           downloadMbps: downloadMbps,
-          uploadMbps: currentMbps,
           downloadedBytes: downloadedBytes,
           uploadedBytes: totalUploadedBytes,
-          mode: mode,
+          mbps: currentMbps,
+          statusMessage: '上传测速中 · ${mode.label}',
           phaseProgress: phaseProgress,
           overallProgress: 0.54 + (phaseProgress * 0.44),
         ),
@@ -503,13 +587,10 @@ class SpeedTestService {
         unawaited(completeWithSample());
       }
     });
-    hardStopTimer = Timer(hardDuration, () {
-      firstError ??= TimeoutException('上传测速超时');
-      unawaited(completeWithSample());
-    });
 
     for (var index = 0; index < mode.connections; index++) {
       unawaited(() async {
+        var workerBytes = 0;
         final client = _createClient(
           overrideHost: config.testEndpoint,
           overrideIp: selectedIp,
@@ -522,14 +603,24 @@ class SpeedTestService {
             config: config,
             stopwatch: stopwatch,
             duration: duration,
-            timeout: hardDuration,
+            uploadWriteTimeout: uploadWriteTimeout,
+            responseTimeout: responseTimeout,
             mode: mode,
-            onChunkSent: (bytes) {
+            onChunkConsumed: (bytes) {
+              workerBytes += bytes;
               totalUploadedBytes += bytes;
             },
           );
 
           resolvedIp ??= uploadResult.usedIp ?? selectedIp;
+
+          if (uploadResult.faulted) {
+            uploadFaultCount++;
+            totalUploadedBytes = (totalUploadedBytes - workerBytes).clamp(
+              0,
+              totalUploadedBytes,
+            );
+          }
 
           if (uploadResult.bytes <= 0 && stopwatch.elapsed < duration) {
             firstError ??= StateError('上传未发送任何数据');
@@ -548,17 +639,17 @@ class SpeedTestService {
 
     final sample = await completer.future;
     onProgress(
-      SpeedTestProgress(
-        phase: SpeedTestPhase.uploading,
-        statusMessage: '上传测速完成',
-        endpoint: sanitizeEndpointHost(config.testEndpoint),
-        usedIp: sample.usedIp,
-        currentMbps: sample.mbps,
+      _uploadProgress(
+        config: config,
+        mode: mode,
+        selectedIp: sample.usedIp,
         downloadMbps: downloadMbps,
-        uploadMbps: sample.mbps,
         downloadedBytes: downloadedBytes,
         uploadedBytes: sample.bytes,
-        mode: mode,
+        mbps: sample.mbps,
+        statusMessage: uploadFaultCount > 0
+            ? '上传测速完成 · $uploadFaultCount 次网络波动'
+            : '上传测速完成',
         phaseProgress: 1,
         overallProgress: 0.98,
       ),
@@ -566,14 +657,43 @@ class SpeedTestService {
     return sample;
   }
 
+  SpeedTestProgress _uploadProgress({
+    required SpeedTestConfig config,
+    required SpeedTestMode mode,
+    required String? selectedIp,
+    required double downloadMbps,
+    required int downloadedBytes,
+    required int uploadedBytes,
+    required double mbps,
+    required String statusMessage,
+    required double phaseProgress,
+    required double overallProgress,
+  }) {
+    return SpeedTestProgress(
+      phase: SpeedTestPhase.uploading,
+      statusMessage: statusMessage,
+      endpoint: sanitizeEndpointHost(config.testEndpoint),
+      usedIp: selectedIp,
+      currentMbps: mbps,
+      downloadMbps: downloadMbps,
+      uploadMbps: mbps,
+      downloadedBytes: downloadedBytes,
+      uploadedBytes: uploadedBytes,
+      mode: mode,
+      phaseProgress: phaseProgress,
+      overallProgress: overallProgress,
+    );
+  }
+
   Future<_UploadRequestResult> _sendUploadRequest({
     required HttpClient client,
     required SpeedTestConfig config,
     required Stopwatch stopwatch,
     required Duration duration,
-    required Duration timeout,
+    required Duration uploadWriteTimeout,
+    required Duration responseTimeout,
     required SpeedTestMode mode,
-    required void Function(int bytes) onChunkSent,
+    required void Function(int bytes) onChunkConsumed,
   }) async {
     final request = await _openUploadRequest(client, config);
     request.bufferOutput = false;
@@ -584,80 +704,86 @@ class SpeedTestService {
       HttpHeaders.acceptLanguageHeader,
       'zh-CN,zh-Hans;q=0.9',
     );
+    request.headers.set(HttpHeaders.userAgentHeader, _userAgent);
     request.headers.set('Upload-Draft-Interop-Version', '6');
     request.headers.set('Upload-Complete', '?1');
     final profile = _uploadWriteProfileFor(mode);
-
-    final uploadedBytes = await _writeStreamingUploadBody(
-      request: request,
-      stopwatch: stopwatch,
-      duration: duration,
-      profile: profile,
-      onChunkFlushed: onChunkSent,
-    );
-    if (_cancelRequested) {
-      request.abort();
-      return const _UploadRequestResult(bytes: 0, usedIp: null);
-    }
+    var consumedBytes = 0;
 
     try {
-      final response = await request.close().timeout(
-        timeout,
-        onTimeout: () {
-          request.abort();
-          throw TimeoutException('上传请求超时');
-        },
-      );
-      await response.drain<void>();
+      await request
+          .addStream(
+            _countingUploadStream(
+              stopwatch: stopwatch,
+              duration: duration,
+              chunkSize: profile.chunkSize,
+              shouldStop: () => _cancelRequested,
+              onChunkConsumed: (bytes) {
+                consumedBytes += bytes;
+                onChunkConsumed(bytes);
+              },
+            ),
+          )
+          .timeout(
+            uploadWriteTimeout,
+            onTimeout: () {
+              request.abort();
+              throw TimeoutException('上传写入超时');
+            },
+          );
+
+      if (_cancelRequested) {
+        request.abort();
+        return const _UploadRequestResult(
+          bytes: 0,
+          usedIp: null,
+          faulted: false,
+        );
+      }
+
+      final responseStopwatch = Stopwatch()..start();
+      final response = await request.close().timeout(responseTimeout);
       final usedIp = response.connectionInfo?.remoteAddress.address;
-
       if (response.statusCode >= 400) {
-        if (uploadedBytes > 0) {
-          onChunkSent(-uploadedBytes);
-        }
-        return _UploadRequestResult(bytes: 0, usedIp: usedIp);
+        return _UploadRequestResult(bytes: 0, usedIp: usedIp, faulted: true);
       }
 
-      return _UploadRequestResult(bytes: uploadedBytes, usedIp: usedIp);
-    } catch (_) {
+      final drainTimeout = responseTimeout - responseStopwatch.elapsed;
+      if (drainTimeout <= Duration.zero) {
+        throw TimeoutException('上传响应超时');
+      }
+      await response.drain<void>().timeout(drainTimeout);
+
+      return _UploadRequestResult(
+        bytes: consumedBytes,
+        usedIp: usedIp,
+        faulted: false,
+      );
+    } on TimeoutException {
       final usedIp = request.connectionInfo?.remoteAddress.address;
-      return _UploadRequestResult(bytes: uploadedBytes, usedIp: usedIp);
-    }
-  }
-
-  Future<int> _writeStreamingUploadBody({
-    required HttpClientRequest request,
-    required Stopwatch stopwatch,
-    required Duration duration,
-    required _UploadWriteProfile profile,
-    required void Function(int bytes) onChunkFlushed,
-  }) async {
-    final chunk = Uint8List(profile.chunkSize);
-    var uploadedBytes = 0;
-    var pendingBytes = 0;
-
-    while (!_cancelRequested && stopwatch.elapsed < duration) {
-      request.add(chunk);
-      pendingBytes += chunk.length;
-
-      if (pendingBytes < profile.flushThresholdBytes &&
-          stopwatch.elapsed < duration) {
-        continue;
+      request.abort();
+      return _UploadRequestResult(
+        bytes: consumedBytes,
+        usedIp: usedIp,
+        faulted: false,
+      );
+    } catch (_) {
+      if (_cancelRequested) {
+        request.abort();
+        return const _UploadRequestResult(
+          bytes: 0,
+          usedIp: null,
+          faulted: false,
+        );
       }
-
-      await request.flush();
-      uploadedBytes += pendingBytes;
-      onChunkFlushed(pendingBytes);
-      pendingBytes = 0;
+      final usedIp = request.connectionInfo?.remoteAddress.address;
+      request.abort();
+      return _UploadRequestResult(
+        bytes: consumedBytes,
+        usedIp: usedIp,
+        faulted: true,
+      );
     }
-
-    if (pendingBytes > 0) {
-      await request.flush();
-      uploadedBytes += pendingBytes;
-      onChunkFlushed(pendingBytes);
-    }
-
-    return uploadedBytes;
   }
 
   Future<HttpClientResponse> _openDownloadResponse(
@@ -688,6 +814,10 @@ class SpeedTestService {
     String host,
     DohProvider provider,
   ) async {
+    if (_resolveHostWithDohOverride case final resolver?) {
+      return resolver(host, provider);
+    }
+
     final ipv4 = await _queryDoh(host, 'A', provider);
     final ipv6 = await _queryDoh(host, 'AAAA', provider);
 
@@ -774,7 +904,7 @@ class SpeedTestService {
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 12)
       ..idleTimeout = const Duration(seconds: 12)
-      ..userAgent = 'AppleSpeedFlutter/1.2';
+      ..userAgent = _userAgent;
 
     if (overrideHost != null && overrideIp != null && overrideIp.isNotEmpty) {
       client.connectionFactory = (uri, proxyHost, proxyPort) async {
@@ -815,6 +945,13 @@ class SpeedTestService {
     return bytes * 8 / elapsed.inMicroseconds;
   }
 
+  Duration _uploadElapsed(Duration elapsed, Duration uploadWindow) {
+    if (elapsed <= Duration.zero) {
+      return const Duration(microseconds: 1);
+    }
+    return elapsed > uploadWindow ? uploadWindow : elapsed;
+  }
+
   double _progressForElapsed(Duration elapsed, Duration total) {
     if (total.inMicroseconds <= 0) {
       return 0;
@@ -824,24 +961,27 @@ class SpeedTestService {
     return raw.clamp(0.0, 1.0);
   }
 
-  Duration _uploadDisplayElapsed(Duration elapsed, SpeedTestMode mode) {
-    final floor = switch (mode) {
-      SpeedTestMode.singleThread => const Duration(seconds: 2),
-      SpeedTestMode.multiThread => const Duration(seconds: 4),
-    };
-
-    return elapsed < floor ? floor : elapsed;
+  Stream<List<int>> _countingUploadStream({
+    required Stopwatch stopwatch,
+    required Duration duration,
+    required int chunkSize,
+    required bool Function() shouldStop,
+    required void Function(int bytes) onChunkConsumed,
+  }) async* {
+    final chunk = Uint8List(chunkSize);
+    while (!shouldStop() && stopwatch.elapsed < duration) {
+      onChunkConsumed(chunk.length);
+      yield chunk;
+    }
   }
 
   _UploadWriteProfile _uploadWriteProfileFor(SpeedTestMode mode) {
     return switch (mode) {
       SpeedTestMode.singleThread => const _UploadWriteProfile(
-        chunkSize: 64 * 1024,
-        flushThresholdBytes: 256 * 1024,
+        chunkSize: 256 * 1024,
       ),
       SpeedTestMode.multiThread => const _UploadWriteProfile(
-        chunkSize: 16 * 1024,
-        flushThresholdBytes: 64 * 1024,
+        chunkSize: 64 * 1024,
       ),
     };
   }
@@ -860,18 +1000,19 @@ class _ThroughputSample {
 }
 
 class _UploadRequestResult {
-  const _UploadRequestResult({required this.bytes, required this.usedIp});
+  const _UploadRequestResult({
+    required this.bytes,
+    required this.usedIp,
+    required this.faulted,
+  });
 
   final int bytes;
   final String? usedIp;
+  final bool faulted;
 }
 
 class _UploadWriteProfile {
-  const _UploadWriteProfile({
-    required this.chunkSize,
-    required this.flushThresholdBytes,
-  });
+  const _UploadWriteProfile({required this.chunkSize});
 
   final int chunkSize;
-  final int flushThresholdBytes;
 }

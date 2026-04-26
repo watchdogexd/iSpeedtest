@@ -1,15 +1,18 @@
 import 'dart:io';
 
+const String defaultSpeedTestEndpointHost = 'mensura.cdn-apple.com';
+
 String sanitizeEndpointHost(String value) {
-  final trimmed = value.trim();
+  final trimmed = value
+      .replaceAll(RegExp(r'[\u0000-\u001F\u007F]+'), ' ')
+      .trim();
   if (trimmed.isEmpty) {
     return trimmed;
   }
 
-  final withoutIpSuffix = trimmed.replaceAll(
-    RegExp(r'(?:\s*\[[^\[\]]+\])+\s*$'),
-    '',
-  );
+  final withoutIpSuffix = trimmed
+      .replaceAll(RegExp(r'(?:\s*\[[^\[\]]+\])+\s*$'), '')
+      .trim();
   if (!_looksLikeEndpointHost(withoutIpSuffix)) {
     return withoutIpSuffix.trim();
   }
@@ -102,9 +105,7 @@ class SpeedTestConfig {
 
   factory SpeedTestConfig.fromJson(Map<String, dynamic> json) {
     final urls = json['urls'] as Map<String, dynamic>? ?? const {};
-    final endpoint = sanitizeEndpointHost(
-      json['test_endpoint'] as String? ?? 'mensura.cdn-apple.com',
-    );
+    const endpoint = defaultSpeedTestEndpointHost;
 
     final small = Uri.parse(
       urls['small_https_download_url'] as String? ??
@@ -156,11 +157,13 @@ class SpeedTestOptions {
     required this.mode,
     required this.endpointHost,
     required this.selectedIp,
+    required this.dohProvider,
   });
 
   final SpeedTestMode mode;
   final String endpointHost;
   final String? selectedIp;
+  final DohProvider dohProvider;
 }
 
 class ResolvedAddressOption {
